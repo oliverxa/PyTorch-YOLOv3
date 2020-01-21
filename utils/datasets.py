@@ -41,6 +41,7 @@ class ImageFolder(Dataset):
         self.files = sorted(glob.glob("%s/*.*" % folder_path))
         self.img_size = img_size
 
+    # ImageFolder中的__getitem__()函数会把图像归一化处理成img_size(默认416)大小的图片
     def __getitem__(self, index):
         img_path = self.files[index % len(self.files)]
         # Extract image as PyTorch tensor

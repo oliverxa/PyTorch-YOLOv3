@@ -20,7 +20,12 @@ from torch.autograd import Variable
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.ticker import NullLocator
-
+"""
+（1）import argparse    首先导入模块
+（2）parser = argparse.ArgumentParser（）    创建一个解析对象
+（3）parser.add_argument()    向该对象中添加你要关注的命令行参数和选项
+（4）parser.parse_args()    进行解析
+"""
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_folder", type=str, default="data/samples", help="path to dataset")
@@ -36,13 +41,16 @@ if __name__ == "__main__":
     opt = parser.parse_args()
     print(opt)
 
+    # 选择是否使用 GPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # 创建输出目录 exist_ok=True 就不用再次创建
     os.makedirs("output", exist_ok=True)
 
     # Set up model
     model = Darknet(opt.model_def, img_size=opt.img_size).to(device)
 
+    # 根据opt.weights_path 最后一位判断是否需要load pretrianed model 还是 checkpoints
     if opt.weights_path.endswith(".weights"):
         # Load darknet weights
         model.load_darknet_weights(opt.weights_path)
@@ -52,6 +60,7 @@ if __name__ == "__main__":
 
     model.eval()  # Set in evaluation mode
 
+    # 测试结果不需要shuffle， 且batch_size应该设置为1， 根据CPU数量设置workers
     dataloader = DataLoader(
         ImageFolder(opt.image_folder, img_size=opt.img_size),
         batch_size=opt.batch_size,
@@ -61,18 +70,20 @@ if __name__ == "__main__":
 
     classes = load_classes(opt.class_path)  # Extracts class labels from file
 
+    # 根据是否使用gpu设置tensor的类型
     Tensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
 
     imgs = []  # Stores image paths
     img_detections = []  # Stores detections for each image index
 
     print("\nPerforming object detection:")
+    # 开始主函数测试， 并计算时间
     prev_time = time.time()
     for batch_i, (img_paths, input_imgs) in enumerate(dataloader):
         # Configure input
         input_imgs = Variable(input_imgs.type(Tensor))
 
-        # Get detections
+        # Get detections 由于是val,因此不需要梯度变化，检测，并对检测结果进行非极大值抑制
         with torch.no_grad():
             detections = model(input_imgs)
             detections = non_max_suppression(detections, opt.conf_thres, opt.nms_thres)
@@ -84,7 +95,7 @@ if __name__ == "__main__":
         print("\t+ Batch %d, Inference Time: %s" % (batch_i, inference_time))
 
         # Save image and detections
-        imgs.extend(img_paths)
+        imgs.extend(img_paths)        
         img_detections.extend(detections)
 
     # Bounding-box colors

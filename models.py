@@ -17,17 +17,20 @@ def create_modules(module_defs):
     """
     Constructs module list of layer blocks from module configuration in module_defs
     """
+    # YOLO層數的編號是從[net]後的第一個Conv開始計算，從0開始編號
+
     hyperparams = module_defs.pop(0)
     output_filters = [int(hyperparams["channels"])]
     module_list = nn.ModuleList()
     for module_i, module_def in enumerate(module_defs):
         modules = nn.Sequential()
 
+        # conv + bn + leakyReLU
         if module_def["type"] == "convolutional":
             bn = int(module_def["batch_normalize"])
-            filters = int(module_def["filters"])
-            kernel_size = int(module_def["size"])
-            pad = (kernel_size - 1) // 2
+            filters = int(module_def["filters"]) # the number of filters
+            kernel_size = int(module_def["size"]) # the size of each filters 3*3
+            pad = (kernel_size - 1) // 2 # same padding
             modules.add_module(
                 f"conv_{module_i}",
                 nn.Conv2d(
@@ -36,7 +39,7 @@ def create_modules(module_defs):
                     kernel_size=kernel_size,
                     stride=int(module_def["stride"]),
                     padding=pad,
-                    bias=not bn,
+                    bias=not bn, # 当卷积层后跟batch normalization层时不要偏置bias
                 ),
             )
             if bn:
@@ -44,7 +47,7 @@ def create_modules(module_defs):
             if module_def["activation"] == "leaky":
                 modules.add_module(f"leaky_{module_i}", nn.LeakyReLU(0.1))
 
-        elif module_def["type"] == "maxpool":
+        elif module_def["type"] == "maxpool": # yolov3 do not have maxpool layer
             kernel_size = int(module_def["size"])
             stride = int(module_def["stride"])
             if kernel_size == 2 and stride == 1:
@@ -53,11 +56,13 @@ def create_modules(module_defs):
             modules.add_module(f"maxpool_{module_i}", maxpool)
 
         elif module_def["type"] == "upsample":
+            # nn.Upsample被弃用
             upsample = Upsample(scale_factor=int(module_def["stride"]), mode="nearest")
             modules.add_module(f"upsample_{module_i}", upsample)
 
         elif module_def["type"] == "route":
             layers = [int(x) for x in module_def["layers"].split(",")]
+            # sum channels 26*26*512+26*26*256=26*26*768
             filters = sum([output_filters[1:][i] for i in layers])
             modules.add_module(f"route_{module_i}", EmptyLayer())
 
@@ -65,9 +70,12 @@ def create_modules(module_defs):
             filters = output_filters[1:][int(module_def["from"])]
             modules.add_module(f"shortcut_{module_i}", EmptyLayer())
 
+    # 有三个Scale，分别是Scale1（下采样2^3=8倍）,Scale2（下采样2^4=16倍），Scale3（下采样2^5=32倍）
+    # 此时网络默认的尺寸是416*416，对应的feature map为52*52，26*26，13*13。
+
         elif module_def["type"] == "yolo":
             anchor_idxs = [int(x) for x in module_def["mask"].split(",")]
-            # Extract anchors
+            # Extract anchors  anchor box尺寸，类别数量，图像尺寸
             anchors = [int(x) for x in module_def["anchors"].split(",")]
             anchors = [(anchors[i], anchors[i + 1]) for i in range(0, len(anchors), 2)]
             anchors = [anchors[i] for i in anchor_idxs]
@@ -92,6 +100,8 @@ class Upsample(nn.Module):
         self.mode = mode
 
     def forward(self, x):
+        # 根据给定 size 或 scale_factor，上采样或下采样输入数据input.
+        # 上采样算法:上采样算法有：nearest, linear(3D-only), bilinear(4D-only), trilinear(5D-only).. 默认为 nearest.
         x = F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
         return x
 
@@ -111,6 +121,14 @@ class YOLOLayer(nn.Module):
         self.anchors = anchors
         self.num_anchors = len(anchors)
         self.num_classes = num_classes
+        """
+        self.ignore_thres = 0.5: IOU > 0.5 预测的那个bounding box的置信度才会计入误差 ,build_targets 返回结果
+        self.mse_loss = nn.MSELoss() : xywh的回归是用MSE, 使用MSE损失时L=0.5*(p-y)^2
+        self.bce_loss = nn.BCELoss() : loss_obj, loss_noobj, loss_cls都是用BCE, L=-(ylogp+(1-y)log(1-p)),
+                                        y是标签(y=0或者1), p是预测的概率(p=0~1)是sigmoid激活函数后输出
+        self.obj_scale = 1, self.noobj_scale = 100: loss_conf 有物体和没有物体的权重,经验值可改
+        self.img_dim : input size
+        """
         self.ignore_thres = 0.5
         self.mse_loss = nn.MSELoss()
         self.bce_loss = nn.BCELoss()
@@ -118,14 +136,20 @@ class YOLOLayer(nn.Module):
         self.noobj_scale = 100
         self.metrics = {}
         self.img_dim = img_dim
-        self.grid_size = 0  # grid size
+        self.grid_size = 0  # grid size 是特征图的大小。
 
     def compute_grid_offsets(self, grid_size, cuda=True):
+        # grid_size和self.grid_size是不相等的，所以需要进行计算偏移
+        # 以gird=13为例。此时特征图是13*13，但原图shape尺寸是416*416，所以要把416*416评价切成13*13个方格，
+        # 需要得到间隔（步距self.stride=416/13=32）。
+        # 相应的并把anchor(116, 90)的尺寸进行缩放，即116/32=3.6250，90/32=2.8125。
         self.grid_size = grid_size
         g = self.grid_size
         FloatTensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
         self.stride = self.img_dim / self.grid_size
         # Calculate offsets for each grid
+        # repeat 相当于一个broadcasting的机制repeat(*sizes)
+        # 沿着指定的维度重复tensor。不同与expand()，本函数复制的是tensor中的数据。
         self.grid_x = torch.arange(g).repeat(g, 1).view([1, 1, g, g]).type(FloatTensor)
         self.grid_y = torch.arange(g).repeat(g, 1).t().view([1, 1, g, g]).type(FloatTensor)
         self.scaled_anchors = FloatTensor([(a_w / self.stride, a_h / self.stride) for a_w, a_h in self.anchors])
@@ -140,13 +164,22 @@ class YOLOLayer(nn.Module):
         ByteTensor = torch.cuda.ByteTensor if x.is_cuda else torch.ByteTensor
 
         self.img_dim = img_dim
-        num_samples = x.size(0)
-        grid_size = x.size(2)
+        num_samples = x.size(0) # conv output samples number
+        grid_size = x.size(2) # conv output feature size
+
+        """
+                所以在输入为416*416时，每个cell的三个anchor box为(116 ,90);
+                (156 ,198); (373 ,326)。16倍适合一般大小的物体，anchor box为
+                (30,61); (62,45); (59,119)。8倍的感受野最小，适合检测小目标，
+                因此anchor box为(10,13); (16,30); (33,23)。所以当输入为416*416时，
+                实际总共有（52*52+26*26+13*13）*3=10647个proposal box。
+        """
+
 
         prediction = (
             x.view(num_samples, self.num_anchors, self.num_classes + 5, grid_size, grid_size)
-            .permute(0, 1, 3, 4, 2)
-            .contiguous()
+            .permute(0, 1, 3, 4, 2) # change to num_samples, self.num_anchors , grid_size, grid_size, self.num_classes + 5
+            .contiguous() # 用了transpose, permute等，需要用contiguous()来返回一个contiguous copy
         )
 
         # Get outputs
@@ -168,6 +201,7 @@ class YOLOLayer(nn.Module):
         pred_boxes[..., 2] = torch.exp(w.data) * self.anchor_w
         pred_boxes[..., 3] = torch.exp(h.data) * self.anchor_h
 
+        # 在最后进行拼接，得到输出output [1,507,85], [1,2028,85], [1,8112,85] 。其507=13*13*3，2028=26*26*3，8112=52*52*3
         output = torch.cat(
             (
                 pred_boxes.view(num_samples, -1, 4) * self.stride,
@@ -235,14 +269,18 @@ class Darknet(nn.Module):
     """YOLOv3 object detection model"""
 
     def __init__(self, config_path, img_size=416):
+        # 根据cfg文件解析网络数据
         super(Darknet, self).__init__()
         self.module_defs = parse_model_config(config_path)
+        # 根据cfg搭建网络 返回超参数和网络列表
         self.hyperparams, self.module_list = create_modules(self.module_defs)
+        # hasattr 函数用于判断对象是否包含对应的属性
         self.yolo_layers = [layer[0] for layer in self.module_list if hasattr(layer[0], "metrics")]
         self.img_size = img_size
         self.seen = 0
         self.header_info = np.array([0, 0, 0, self.seen, 0], dtype=np.int32)
 
+    # 根据 self.module_defs, self.module_list 搭建网络
     def forward(self, x, targets=None):
         img_dim = x.shape[2]
         loss = 0
@@ -250,17 +288,26 @@ class Darknet(nn.Module):
         for i, (module_def, module) in enumerate(zip(self.module_defs, self.module_list)):
             if module_def["type"] in ["convolutional", "upsample", "maxpool"]:
                 x = module(x)
+            ###
+            # 这个route层，实际上是把几个层拼在一块。
+            # 当layers属性只有一个值时:
+            # 這個做法是要將這層之後要做的事情，往前接到前4層的輸出結果來做(-4是前4層的輸出結果)，這個目的是為了而外做一分支出來
+            # 当layers层有两个值时:
+            # 它会返回由其值所索引的层的特征图的连接。在我们的例子中，它是-1,61，该层输出来自前一层（-1）和第61层的特征图，它们沿着深度维度进行连接。
+            ###
             elif module_def["type"] == "route":
                 x = torch.cat([layer_outputs[int(layer_i)] for layer_i in module_def["layers"].split(",")], 1)
+            # shortcut 当前层和from层相连
             elif module_def["type"] == "shortcut":
                 layer_i = int(module_def["from"])
                 x = layer_outputs[-1] + layer_outputs[layer_i]
+            # yolo是输出层
             elif module_def["type"] == "yolo":
                 x, layer_loss = module[0](x, targets, img_dim)
                 loss += layer_loss
                 yolo_outputs.append(x)
             layer_outputs.append(x)
-        yolo_outputs = to_cpu(torch.cat(yolo_outputs, 1))
+        yolo_outputs = to_cpu(torch.cat(yolo_outputs, 1)) #按维数1拼接（横着拼）
         return yolo_outputs if targets is None else (loss, yolo_outputs)
 
     def load_darknet_weights(self, weights_path):
@@ -282,13 +329,15 @@ class Darknet(nn.Module):
         for i, (module_def, module) in enumerate(zip(self.module_defs, self.module_list)):
             if i == cutoff:
                 break
+            # 加载CNN层权重
             if module_def["type"] == "convolutional":
                 conv_layer = module[0]
                 if module_def["batch_normalize"]:
                     # Load BN bias, weights, running mean and running variance
                     bn_layer = module[1]
-                    num_b = bn_layer.bias.numel()  # Number of biases
+                    num_b = bn_layer.bias.numel()  # Number of biases .numel()矩阵内元素的个数
                     # Bias
+                    # .view_as(tensor) = .view(tensor.size())
                     bn_b = torch.from_numpy(weights[ptr : ptr + num_b]).view_as(bn_layer.bias)
                     bn_layer.bias.data.copy_(bn_b)
                     ptr += num_b
@@ -304,7 +353,8 @@ class Darknet(nn.Module):
                     bn_rv = torch.from_numpy(weights[ptr : ptr + num_b]).view_as(bn_layer.running_var)
                     bn_layer.running_var.data.copy_(bn_rv)
                     ptr += num_b
-                else:
+                else: # else do not use
+                    # if module_def["batch_normalize"] = False
                     # Load conv. bias
                     num_b = conv_layer.bias.numel()
                     conv_b = torch.from_numpy(weights[ptr : ptr + num_b]).view_as(conv_layer.bias)
@@ -340,6 +390,7 @@ class Darknet(nn.Module):
                 else:
                     conv_layer.bias.data.cpu().numpy().tofile(fp)
                 # Load conv weights
+                # 当卷积层后跟batch normalization层时不要偏置bias
                 conv_layer.weight.data.cpu().numpy().tofile(fp)
 
         fp.close()

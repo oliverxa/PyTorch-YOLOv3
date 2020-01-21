@@ -12,6 +12,7 @@ import matplotlib.patches as patches
 
 
 def to_cpu(tensor):
+    # 添加detach(),requires_grad为False, 切断反向传播
     return tensor.detach().cpu()
 
 
@@ -28,8 +29,10 @@ def weights_init_normal(m):
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
         torch.nn.init.normal_(m.weight.data, 0.0, 0.02)
+        # torch.nn.init.kaiming_uniform_(m.weight.data, 0.01)
     elif classname.find("BatchNorm2d") != -1:
         torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
+        # torch.nn.init.constant_(m.weight.data, 1.0)
         torch.nn.init.constant_(m.bias.data, 0.0)
 
 
@@ -249,12 +252,14 @@ def non_max_suppression(prediction, conf_thres=0.5, nms_thres=0.4):
         # Perform non-maximum suppression
         keep_boxes = []
         while detections.size(0):
+            # 筛去低于阈值的bounding box
             large_overlap = bbox_iou(detections[0, :4].unsqueeze(0), detections[:, :4]) > nms_thres
             label_match = detections[0, -1] == detections[:, -1]
             # Indices of boxes with lower confidence scores, large IOUs and matching labels
             invalid = large_overlap & label_match
             weights = detections[invalid, 4:5]
             # Merge overlapping bboxes by order of confidence
+            # 这里采取了边界框“融合”的策略, 所有的bounding box 以 weights 作为权重求个均值
             detections[0, :4] = (weights * detections[invalid, :4]).sum(0) / weights.sum()
             keep_boxes += [detections[0]]
             detections = detections[~invalid]

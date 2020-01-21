@@ -47,6 +47,7 @@ if __name__ == "__main__":
     os.makedirs("checkpoints", exist_ok=True)
 
     # Get data configuration
+    # xxx.data 文件里面有 train, val, class三个文件的路径
     data_config = parse_data_config(opt.data_config)
     train_path = data_config["train"]
     valid_path = data_config["valid"]
@@ -54,7 +55,7 @@ if __name__ == "__main__":
 
     # Initiate model
     model = Darknet(opt.model_def).to(device)
-    model.apply(weights_init_normal)
+    model.apply(weights_init_normal) # model.apply():实现初始化 : normal初始化, 可改
 
     # If specified we start from checkpoint
     if opt.pretrained_weights:
@@ -68,7 +69,7 @@ if __name__ == "__main__":
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=opt.batch_size,
-        shuffle=True,
+        shuffle=True, # 训练 shuffle设置为true
         num_workers=opt.n_cpu,
         pin_memory=True,
         collate_fn=dataset.collate_fn,

@@ -5,6 +5,7 @@ def parse_model_config(path):
     file = open(path, 'r')
     lines = file.read().split('\n')
     lines = [x for x in lines if x and not x.startswith('#')]
+    # 应该可以用.strip()代替 .rstrip().lstrip()
     lines = [x.rstrip().lstrip() for x in lines] # get rid of fringe whitespaces
     module_defs = []
     for line in lines:
